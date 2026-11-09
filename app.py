@@ -4,12 +4,14 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 import io
 import os
+import re
 import json
 import base64
 import datetime
 import zipfile
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from rapidocr_onnxruntime import RapidOCR
 
 st.set_page_config(
     page_title="MTS 조건검색 데이터 추출기",
@@ -38,18 +40,23 @@ st.markdown("""
 
 # Top Bar & Navigation
 st.title("📈 MTS 조건검색 데이터 추출기")
-st.caption("캡처 사진만 올리면 조건식별 자동 분류, 스크롤 중복 제거, 엑셀/시트 변환 및 화면 즉시 비교까지 한 번에!")
+st.caption("캡처 사진만 올리면 조건식별 자동 분류, 스크롤 중복 제거, 엑셀/시트 변환 및 화면 즉시 비교까지 한 번에! (100% 무료 무제한)")
 
-# Load pre-parsed rich condition data if available
-@st.cache_data
-def load_base_stock_data():
-    json_path = os.path.join(os.path.dirname(__file__), "sample_extracted_data.json")
-    if os.path.exists(json_path):
-        with open(json_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+# Initialize OCR Engines (Cached so they only load once into memory)
+@st.cache_resource
+def get_ocr_engines():
+    base_dir = os.path.dirname(__file__)
+    model_path = os.path.join(base_dir, "korean_rec.onnx")
+    dict_path = os.path.join(base_dir, "korean_dict.txt")
+    
+    eng_default = RapidOCR()
+    if os.path.exists(model_path) and os.path.exists(dict_path):
+        eng_korean = RapidOCR(rec_model_path=model_path, rec_keys_path=dict_path)
+    else:
+        eng_korean = eng_default
+    return eng_default, eng_korean
 
-base_data = load_base_stock_data()
+ocr_default, ocr_korean = get_ocr_engines()
 
 def extract_exif_date(image):
     try:
@@ -62,14 +69,96 @@ def extract_exif_date(image):
         pass
     return datetime.date.today().strftime("%Y-%m-%d")
 
+def parse_single_image(img_bytes_or_pil):
+    if isinstance(img_bytes_or_pil, io.BytesIO):
+        img_bytes_or_pil.seek(0)
+        img = Image.open(img_bytes_or_pil)
+    else:
+        img = img_bytes_or_pil
+        
+    # Convert image to RGB if necessary
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+        
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    img_data = buf.getvalue()
+    
+    # 1. Condition Name Extraction using Korean OCR engine
+    cond_title = "기타 조건식"
+    try:
+        res_ko, _ = ocr_korean(img_data)
+        if res_ko:
+            for item in sorted(res_ko, key=lambda x: x[0][0][1])[:15]:
+                t = item[1].strip()
+                if any(k in t for k in ["신고가", "정배열", "역배열", "주도주", "섹터", "후보군", "골든", "돌파", "["]):
+                    # Clean up
+                    cond_title = t
+                    break
+    except Exception:
+        pass
+        
+    # 2. Extract stock rows using high-precision default engine
+    stocks = []
+    try:
+        res_en, _ = ocr_default(img_data)
+        if res_en:
+            # Filter table region
+            h = img.height
+            table_items = [it for it in res_en if 0.15 * h < (it[0][0][1] + it[0][2][1])/2 < 0.92 * h]
+            
+            # Find % signs which uniquely define each stock row
+            pct_items = sorted([it for it in table_items if "%" in it[1] or "％" in it[1]], 
+                               key=lambda x: (x[0][0][1] + x[0][2][1])/2)
+            
+            for pct in pct_items:
+                y_pct = (pct[0][0][1] + pct[0][2][1])/2
+                # Row elements within row window
+                row_elements = [it for it in table_items if (y_pct - 50) <= (it[0][0][1] + it[0][2][1])/2 <= (y_pct + 120)]
+                row_elements.sort(key=lambda x: x[0][0][0])
+                
+                # Extract ticker or stock code
+                # US ticker: 2-6 uppercase letters (excluding US/KR/MTS tags)
+                tickers = [it[1].strip() for it in row_elements if re.match(r'^[A-Z]{2,6}$', it[1].strip()) and it[1].strip() not in ['US', 'KR', 'ETF']]
+                # Korean stock code: 6 digits
+                kr_codes = [it[1].strip() for it in row_elements if re.match(r'^\d{6}$', it[1].strip())]
+                
+                ticker = tickers[0] if tickers else (kr_codes[0] if kr_codes else "")
+                
+                # Numbers with decimals: price, change $
+                decimals = [it[1].strip() for it in row_elements if re.match(r'^\d[\d,]*\.\d+$', it[1].strip())]
+                price = decimals[0] if len(decimals) >= 1 else ""
+                chg_dollar = decimals[1] if len(decimals) >= 2 else ""
+                
+                # Volume: large integer without decimal point
+                ints = [it[1].strip() for it in row_elements if re.search(r'[\d,]{4,}', it[1].strip()) and '.' not in it[1]]
+                vol = ints[0] if ints else ""
+                
+                pct_str = pct[1].strip()
+                
+                if ticker or price:
+                    stocks.append({
+                        "조건식": cond_title,
+                        "종목명": ticker, # Default to ticker if name is English
+                        "티커": ticker,
+                        "현재가": price,
+                        "등락률": pct_str,
+                        "전일대비": chg_dollar,
+                        "거래량": vol
+                    })
+    except Exception:
+        pass
+        
+    return cond_title, stocks
+
 def generate_excel_bytes(data_dict, base_date):
     wb = openpyxl.Workbook()
     wb.remove(wb.active) # Remove default sheet
     
     navy_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     white_bold = Font(name="맑은 고딕", size=10, bold=True, color="FFFFFF")
-    title_font = Font(name="맑은 고딕", size=14, bold=True, color="1F4E79")
-    sub_font = Font(name="맑은 고딕", size=10, italic=True, color="595959")
+    title_font = Font(name="맑은 고딕", size=13, bold=True, color="1F4E79")
+    sub_font = Font(name="맑은 고딕", size=9, italic=True, color="595959")
     border_thin = Border(
         left=Side(style="thin", color="D9D9D9"),
         right=Side(style="thin", color="D9D9D9"),
@@ -78,35 +167,60 @@ def generate_excel_bytes(data_dict, base_date):
     )
     center_align = Alignment(horizontal="center", vertical="center")
     
-    for sheet_name, rows in data_dict.items():
-        ws = wb.create_sheet(title=sheet_name[:31])
+    # 1. Summary Sheet
+    ws_sum = wb.create_sheet(title="조건식_목록_요약")
+    ws_sum.views.sheetView[0].showGridLines = True
+    ws_sum.append(["조건식 데이터 요약"])
+    ws_sum.append([f"기준일자: {base_date} | 총 {len(data_dict)}개 조건식"])
+    ws_sum.append([])
+    ws_sum.append(["No", "조건식 제목", "추출 종목 수"])
+    ws_sum.cell(row=1, column=1).font = title_font
+    ws_sum.cell(row=2, column=1).font = sub_font
+    for c in range(1, 4):
+        ws_sum.cell(row=4, column=c).fill = navy_fill
+        ws_sum.cell(row=4, column=c).font = white_bold
+        ws_sum.cell(row=4, column=c).alignment = center_align
+        
+    for idx, (c_name, c_stocks) in enumerate(data_dict.items(), start=1):
+        ws_sum.append([idx, c_name, len(c_stocks)])
+        for c in range(1, 4):
+            ws_sum.cell(row=ws_sum.max_row, column=c).border = border_thin
+            
+    # 2. Individual Condition Sheets
+    for c_name, c_stocks in data_dict.items():
+        # Clean sheet title (max 31 chars, no invalid chars)
+        sheet_title = re.sub(r'[\\/*?:\[\]]', '_', c_name)[:30]
+        ws = wb.create_sheet(title=sheet_title)
         ws.views.sheetView[0].showGridLines = True
         
-        for r_idx, r in enumerate(rows, start=1):
-            cleaned = [c for c in r if c != ""]
-            if not cleaned:
-                continue
-            ws.append(cleaned)
-            curr_row = ws.max_row
+        ws.append([c_name])
+        ws.append([f"기준일자: {base_date} | 추출 종목: 총 {len(c_stocks)}개"])
+        ws.append([])
+        headers = ["No", "종목명", "티커", "현재가", "등락률", "전일대비", "거래량"]
+        ws.append(headers)
+        
+        ws.cell(row=1, column=1).font = title_font
+        ws.cell(row=2, column=1).font = sub_font
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=4, column=col_idx)
+            cell.fill = navy_fill
+            cell.font = white_bold
+            cell.alignment = center_align
             
-            # Format header row
-            if "종목명" in cleaned or ("No" in cleaned and "조건식" in cleaned):
-                for col_idx in range(1, len(cleaned) + 1):
-                    cell = ws.cell(row=curr_row, column=col_idx)
-                    cell.fill = navy_fill
-                    cell.font = white_bold
-                    cell.alignment = center_align
-            elif len(cleaned) == 1 and curr_row == 1:
-                cell = ws.cell(row=curr_row, column=1)
-                cell.font = title_font
-            elif len(cleaned) == 1 and curr_row == 2:
-                cell = ws.cell(row=curr_row, column=1)
-                cell.font = sub_font
-            elif curr_row > 3:
-                for col_idx in range(1, len(cleaned) + 1):
-                    cell = ws.cell(row=curr_row, column=col_idx)
-                    cell.border = border_thin
-                    
+        for s_idx, s in enumerate(c_stocks, start=1):
+            row_vals = [
+                s_idx,
+                s.get("종목명", ""),
+                s.get("티커", ""),
+                s.get("현재가", ""),
+                s.get("등락률", ""),
+                s.get("전일대비", ""),
+                s.get("거래량", "")
+            ]
+            ws.append(row_vals)
+            for col_idx in range(1, len(headers) + 1):
+                ws.cell(row=ws.max_row, column=col_idx).border = border_thin
+                
         for col in ws.columns:
             max_len = max(len(str(cell.value or '')) for cell in col)
             col_letter = col[0].column_letter
@@ -152,43 +266,50 @@ if uploaded_files:
         else:
             all_images.append(f)
             
-    st.success(f"총 {len(all_images)}장의 사진이 확인되었습니다. 분석을 완료했습니다! 🎉")
+    st.info(f"총 {len(all_images)}장의 사진을 확인했습니다. 텍스트 추출 및 정밀 분석을 시작합니다...")
     
-    # Exif date extraction
+    # Progress Bar & Status Text
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Real Dynamic OCR Processing
+    extracted_by_condition = {}
     detected_date = datetime.date.today().strftime("%Y-%m-%d")
-    if all_images:
-        try:
-            img = Image.open(all_images[0])
-            detected_date = extract_exif_date(img)
-        except Exception:
-            pass
+    
+    for i, file in enumerate(all_images):
+        status_text.text(f"🔍 사진 분석 중 ({i+1}/{len(all_images)}): {file.name}")
+        image = Image.open(file)
+        if i == 0:
+            detected_date = extract_exif_date(image)
+            
+        c_title, stocks = parse_single_image(file)
+        
+        if c_title not in extracted_by_condition:
+            extracted_by_condition[c_title] = []
+            
+        # De-duplicate stocks within condition formula (scroll overlap removal)
+        existing_keys = {s["티커"] for s in extracted_by_condition[c_title] if s.get("티커")}
+        for s in stocks:
+            t = s.get("티커")
+            if t and t in existing_keys:
+                continue # Skip scroll duplicate
+            if t:
+                existing_keys.add(t)
+            extracted_by_condition[c_title].append(s)
+            
+        progress_bar.progress((i + 1) / len(all_images))
+        
+    status_text.text(f"분석 및 중복 제거 완료! 🎉 (총 {len(all_images)}장 완료)")
+    st.success(f"총 {len(all_images)}장의 사진에서 중복 종목을 제거하고 분석을 완료했습니다!")
 
-    # Build structured data
-    current_data = base_data if base_data else {}
-    
-    # Build Master DataFrame for consolidated CSV and in-app viewing
+    # Master DataFrame for consolidated CSV and in-app viewing
     all_stock_rows = []
-    condition_names = []
-    
-    for sheet_name, rows in current_data.items():
-        if sheet_name == "조건식_목록_요약":
-            continue
-        condition_names.append(sheet_name)
-        cond_title = sheet_name
-        header = None
-        for r in rows:
-            cleaned = [c for c in r if c != ""]
-            if len(cleaned) == 1 and ("[" in cleaned[0] or "조건식" in cleaned[0]):
-                cond_title = cleaned[0]
-            elif "종목명" in cleaned and ("현재가" in str(cleaned) or "No" in cleaned):
-                header = cleaned
-            elif header and len(cleaned) >= 5 and cleaned[0] != "No":
-                row_dict = {"조건식": cond_title}
-                for h, v in zip(header[1:], cleaned[1:]):
-                    row_dict[h] = v
-                all_stock_rows.append(row_dict)
+    for c_title, stock_list in extracted_by_condition.items():
+        for s in stock_list:
+            all_stock_rows.append(s)
 
     master_df = pd.DataFrame(all_stock_rows) if all_stock_rows else pd.DataFrame()
+    condition_names = list(extracted_by_condition.keys())
     
     # Overview Summary Metric Cards
     mcol1, mcol2, mcol3 = st.columns(3)
@@ -215,33 +336,17 @@ if uploaded_files:
         st.markdown("**확인하고 싶은 조건식을 선택해 주세요:**")
         selected_cond = st.selectbox(
             "조건식 선택",
-            options=condition_names,
+            options=condition_names if condition_names else ["없음"],
             label_visibility="collapsed"
         )
-        if selected_cond and selected_cond in current_data:
-            cond_rows = current_data[selected_cond]
-            # Parse rows into DataFrame
-            hdr = None
-            data_rows = []
-            title_text = selected_cond
-            for r in cond_rows:
-                c = [item for item in r if item != ""]
-                if len(c) == 1 and ("[" in c[0] or "조건식" in c[0]):
-                    title_text = c[0]
-                elif "종목명" in c and ("No" in c or "현재가" in str(c)):
-                    hdr = c
-                elif hdr and len(c) >= 4 and c[0] != "No":
-                    data_rows.append(c)
-            
-            st.info(f"📌 **{title_text}** (추출된 종목: {len(data_rows)}개)")
-            if hdr and data_rows:
-                # pad or slice rows to match hdr length
-                clean_data = []
-                for row in data_rows:
-                    if len(row) < len(hdr):
-                        row = row + [""] * (len(hdr) - len(row))
-                    clean_data.append(row[:len(hdr)])
-                df_cond = pd.DataFrame(clean_data, columns=hdr)
+        if selected_cond and selected_cond in extracted_by_condition:
+            c_stocks = extracted_by_condition[selected_cond]
+            st.info(f"📌 **{selected_cond}** (추출된 종목: {len(c_stocks)}개)")
+            if c_stocks:
+                df_cond = pd.DataFrame(c_stocks)
+                # drop condition column inside its own tab
+                if "조건식" in df_cond.columns:
+                    df_cond = df_cond.drop(columns=["조건식"])
                 st.dataframe(df_cond, use_container_width=True, hide_index=True)
             else:
                 st.write("해당 조건식에 부합하는 종목이 없습니다 (0종목).")
@@ -260,19 +365,9 @@ if uploaded_files:
             st.write("표시할 종목 데이터가 없습니다.")
 
     with tab_summary:
-        if "조건식_목록_요약" in current_data:
-            summary_rows = current_data["조건식_목록_요약"]
-            s_hdr = None
-            s_data = []
-            for r in summary_rows:
-                c = [item for item in r if item != ""]
-                if "조건식 제목" in c or ("No" in c and "추출 종목 수" in c):
-                    s_hdr = c
-                elif s_hdr and len(c) >= 3 and c[0] != "No":
-                    s_data.append(c)
-            if s_hdr and s_data:
-                clean_s = [row[:len(s_hdr)] if len(row) >= len(s_hdr) else row + [""]*(len(s_hdr)-len(row)) for row in s_data]
-                st.dataframe(pd.DataFrame(clean_s, columns=s_hdr), use_container_width=True, hide_index=True)
+        summary_list = [{"No": i+1, "조건식 제목": c, "추출 종목 수": len(s)} for i, (c, s) in enumerate(extracted_by_condition.items())]
+        if summary_list:
+            st.dataframe(pd.DataFrame(summary_list), use_container_width=True, hide_index=True)
 
     st.write("---")
 
@@ -280,7 +375,7 @@ if uploaded_files:
     st.subheader("💾 파일 다운로드")
     
     # Generate actual binary file contents
-    excel_bytes = generate_excel_bytes(current_data, detected_date)
+    excel_bytes = generate_excel_bytes(extracted_by_condition, detected_date)
     csv_bytes = master_df.to_csv(index=False).encode('utf-8-sig') if not master_df.empty else b""
     
     b64_excel = base64.b64encode(excel_bytes).decode()
