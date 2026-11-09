@@ -5,6 +5,7 @@ from PIL.ExifTags import TAGS
 import io
 import os
 import json
+import base64
 import datetime
 import zipfile
 import openpyxl
@@ -29,6 +30,8 @@ st.markdown("""
     .metric-box h4 { margin: 0; color: #64748B; font-size: 0.85rem; }
     .metric-box h2 { margin: 4px 0 0 0; color: #1F4E79; font-size: 1.4rem; font-weight: 700; }
     .guide-box { background: #EFF6FF; border-left: 4px solid #3B82F6; padding: 12px 14px; border-radius: 0 8px 8px 0; font-size: 0.9rem; color: #1E3A8A; margin-bottom: 15px; }
+    .pwa-download-btn { display: block; width: 100%; padding: 10px 14px; background-color: #1F4E79; color: white !important; text-align: center; border-radius: 8px; font-weight: 600; text-decoration: none; font-size: 0.95rem; margin-top: 4px; box-sizing: border-box; }
+    .pwa-download-btn:active { background-color: #153452; }
     div[data-testid="stFileUploader"] { margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
@@ -279,19 +282,39 @@ if uploaded_files:
     # Generate actual binary file contents
     excel_bytes = generate_excel_bytes(current_data, detected_date)
     csv_bytes = master_df.to_csv(index=False).encode('utf-8-sig') if not master_df.empty else b""
+    
+    b64_excel = base64.b64encode(excel_bytes).decode()
+    b64_csv = base64.b64encode(csv_bytes).decode() if csv_bytes else ""
 
     dcol1, dcol2 = st.columns(2)
     with dcol1:
+        st.markdown(f'''
+            <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_excel}" 
+               download="MTS_조건검색_추출_{detected_date}.xlsx" 
+               target="_blank" 
+               class="pwa-download-btn">
+                📥 조건식별 엑셀(.xlsx) 새창 다운로드
+            </a>
+        ''', unsafe_allow_html=True)
         st.download_button(
-            label="📥 조건식별 탭 분리 엑셀(.xlsx) 다운로드",
+            label="📥 기본 엑셀 다운로드 (사파리용)",
             data=excel_bytes,
             file_name=f"MTS_조건검색_추출_{detected_date}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
     with dcol2:
+        if b64_csv:
+            st.markdown(f'''
+                <a href="data:text/csv;charset=utf-8;base64,{b64_csv}" 
+                   download="MTS_조건검색_전체_{detected_date}.csv" 
+                   target="_blank" 
+                   class="pwa-download-btn">
+                    📄 전체 통합 CSV(.csv) 새창 다운로드
+                </a>
+            ''', unsafe_allow_html=True)
         st.download_button(
-            label="📄 전체 통합 데이터 CSV(.csv) 다운로드",
+            label="📄 기본 CSV 다운로드 (사파리용)",
             data=csv_bytes,
             file_name=f"MTS_조건검색_전체_{detected_date}.csv",
             mime="text/csv",
@@ -301,9 +324,10 @@ if uploaded_files:
     # iOS User Experience Guide
     st.markdown("""
     <div class="guide-box">
-        <b>💡 아이폰 사파리 / 홈 화면 웹앱 이용 안내</b><br>
-        • 두 파일의 전체 내용은 굳이 다운로드받지 않으셔도 위 <b>'1. 조건식별 상세 시트'</b>와 <b>'2. 전체 통합 종목 표'</b> 탭에서 바로 넘겨보며 확인 및 비교하실 수 있습니다.<br>
-        • 다운로드 버튼을 눌러 아이폰 문서 뷰어가 열린 경우, 상단 좌측의 <b>'완료'</b>를 누르시거나 아래 <b>'◀ 닫기 / 새 작업 시작'</b> 버튼을 누르면 다음 작업으로 바로 이어집니다.
+        <b>💡 아이폰 연속 업무 꿀팁</b><br>
+        • <b>추천 1 (앱 내 확인)</b>: 다운로드를 누르지 않아도 위 <b>'1. 조건식별 상세 시트'</b>와 <b>'2. 전체 통합 종목 표'</b> 탭에서 두 파일의 모든 내용을 바로 비교·검색하실 수 있습니다.<br>
+        • <b>추천 2 (사파리 탭 사용)</b>: '홈 화면 아이콘' 대신 <b>일반 사파리 브라우저 탭(mina-stock.streamlit.app)</b>으로 열어두시면, 상단에 항상 <b>'뒤로가기(<)'</b>가 유지되어 파일 다운로드 후에도 1초 만에 복귀할 수 있습니다.<br>
+        • <b>새창 다운로드 버튼</b>: 홈 화면 앱에서 갇히는 현상을 방지하기 위해 사파리 새 창을 여는 버튼을 상단에 함께 제공합니다.
     </div>
     """, unsafe_allow_html=True)
 
