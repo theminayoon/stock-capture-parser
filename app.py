@@ -36,10 +36,12 @@ with st.sidebar:
     sort_by_change = st.checkbox("등락률 순 정렬", value=True)
     st.info("💡 팁: 아이폰 사파리에서 '공유 → 홈 화면에 추가'를 누르면 전용 앱처럼 사용하실 수 있어요.")
 
+import zipfile
+
 # File uploader
 uploaded_files = st.file_uploader(
-    "📸 MTS 캡처 사진들을 선택해주세요 (여러 장 동시 선택 가능)",
-    type=["png", "jpg", "jpeg"],
+    "📸 MTS 캡처 사진들을 선택해주세요 (여러 장 동시 선택 또는 ZIP 압축파일 가능)",
+    type=["png", "jpg", "jpeg", "PNG", "JPG", "JPEG", "zip", "ZIP"],
     accept_multiple_files=True
 )
 
@@ -56,7 +58,23 @@ def extract_exif_date(image):
     return datetime.date.today().strftime("%Y-%m-%d")
 
 if uploaded_files:
-    st.success(f"총 {len(uploaded_files)}장의 사진이 업로드되었습니다. 분석을 시작합니다.")
+    # Unpack zip files if present
+    all_images = []
+    for f in uploaded_files:
+        if f.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(f) as z:
+                    for filename in z.namelist():
+                        if filename.lower().endswith(('.png', '.jpg', '.jpeg')) and not filename.startswith('__MACOSX'):
+                            img_bytes = io.BytesIO(z.read(filename))
+                            img_bytes.name = filename
+                            all_images.append(img_bytes)
+            except Exception as e:
+                st.error(f"ZIP 파일 해제 중 오류: {e}")
+        else:
+            all_images.append(f)
+            
+    st.success(f"총 {len(all_images)}장의 사진이 확인되었습니다. 분석을 시작합니다.")
     
     # Process images with progress
     progress_bar = st.progress(0)
@@ -65,18 +83,18 @@ if uploaded_files:
     # Simulated structure dictionary for extraction
     results = {}
     
-    for i, file in enumerate(uploaded_files):
-        status_text.text(f"분석 중 ({i+1}/{len(uploaded_files)}): {file.name}")
+    for i, file in enumerate(all_images):
+        status_text.text(f"분석 중 ({i+1}/{len(all_images)}): {file.name}")
         image = Image.open(file)
         date_str = extract_exif_date(image)
-        progress_bar.progress((i + 1) / len(uploaded_files))
+        progress_bar.progress((i + 1) / len(all_images))
         
     status_text.text("분석 및 중복 제거 완료! 🎉")
     
     # Overview cards
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.markdown(f'<div class="metric-box"><h4>총 사진</h4><h2>{len(uploaded_files)}장</h2></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-box"><h4>총 사진</h4><h2>{len(all_images)}장</h2></div>', unsafe_allow_html=True)
     with col2:
         st.markdown(f'<div class="metric-box"><h4>분류된 조건식</h4><h2>13개</h2></div>', unsafe_allow_html=True)
     with col3:
